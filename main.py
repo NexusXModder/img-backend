@@ -1,114 +1,170 @@
+import json
 import os
 import shutil
 import subprocess
 import tempfile
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 
-app = FastAPI(title="Metadata Masterclass API")
+app = FastAPI(title="Metadata Masterclass API", version="1.1.0")
 
-# Vercel / Frontend Domain থেকে রিকোয়েস্ট অ্যালাউ করার জন্য CORS setup
+# Set FRONTEND_ORIGINS on the hosting service to comma-separated exact origins,
+# e.g. https://your-frontend.vercel.app,https://your-domain.com
+_raw_origins = os.getenv("FRONTEND_ORIGINS", "*")
+_allowed_origins = [origin.strip() for origin in _raw_origins.split(",") if origin.strip()]
+# Wildcard origins must not be combined with credentialed browser requests.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Production-এ আপনার Frontend URL দিতে পারেন
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=_allowed_origins or ["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-def run_exiftool(args: list):
-    """ExifTool CLI কমান্ড রান করার লসলেস ফাংশন"""
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".webp"}
+
+
+def run_exiftool(args: list[str]) -> str:
+    """Run ExifTool without invoking a shell and return stdout."""
     try:
-        cmd = ["exiftool"] + args
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        result = subprocess.run(
+            ["exiftool", "-charset", "filename=UTF8", *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+            timeout=90,
+        )
         return result.stdout
-    except subprocess.CalledProcessError as e:
-        raise Exception(f"ExifTool Error: {e.stderr}")
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="ExifTool is not installed on the backend.")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Image processing timed out.")
+    except subprocess.CalledProcessError as exc:
+        message = (exc.stderr or exc.stdout or "ExifTool failed").strip()
+        raise HTTPException(status_code=422, detail=f"ExifTool could not process this file: {message[:1200]}")
+
+
+def validate_upload(file: UploadFile) -> str:
+    filename = Path(file.filename or "upload").name
+    suffix = Path(filename).suffix.lower()
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail="Unsupported file type. Upload JPG, PNG, HEIC/HEIF, TIFF, or WEBP.",
+        )
+    return suffix
+
+
+def save_upload(file: UploadFile, suffix: str) -> str:
+    fd, path = tempfile.mkstemp(prefix="metadata-", suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as target:
+            shutil.copyfileobj(file.file, target)
+        if os.path.getsize(path) == 0:
+            os.remove(path)
+            raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+        if os.path.getsize(path) > MAX_UPLOAD_BYTES:
+            os.remove(path)
+            raise HTTPException(
+                status_code=413,
+                detail=f"File exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.",
+            )
+        return path
+    except Exception:
+        if os.path.exists(path):
+            os.remove(path)
+        raise
+
+
+@app.get("/")
+def home():
+    return {"status": "ok", "service": "Metadata Masterclass Engine", "version": app.version}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 
 @app.post("/api/inspect")
 async def inspect_metadata(file: UploadFile = File(...)):
-    """ফাইলের পিক্সেলে টাচ না করে শুধু বর্তমান মেটাডাটা রিড করার API"""
-    suffix = os.path.splitext(file.filename)[1]
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = tmp.name
-
+    suffix = validate_upload(file)
+    tmp_path = save_upload(file, suffix)
     try:
-        # ExifTool দিয়ে JSON বয়লারে মেটাডাটা নেওয়া
-        import json
-        output = run_exiftool(["-json", tmp_path])
-        data = json.loads(output)[0]
-        return JSONResponse(content={"status": "success", "metadata": data})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        output = run_exiftool(["-json", "-G", "-a", tmp_path])
+        try:
+            records = json.loads(output)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=422, detail="ExifTool returned invalid metadata JSON.")
+        metadata = records[0] if records else {}
+        return {"status": "success", "metadata": metadata}
     finally:
+        await file.close()
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
 
 @app.post("/api/process")
 async def process_image(
     file: UploadFile = File(...),
     strip_all: bool = Form(False),
     strip_ai: bool = Form(False),
-    custom_date: str = Form(None), # Format: YYYY:MM:DD HH:MM:SS
-    camera_model: str = Form(None)
+    custom_date: Optional[str] = Form(None),
+    camera_model: Optional[str] = Form(None),
 ):
-    """
-    ১০০% Lossless Metadata Manipulation API.
-    ছবি রি-কোড/কম্প্রেস করা হয় না, শুধু বাইনারি এক্সিফ ফিল্ড আপডেট হয়।
-    """
-    suffix = os.path.splitext(file.filename)[1]
-    
-    # টেম্পোরারি ফাইল ক্রিয়েট
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = tmp.name
-
+    suffix = validate_upload(file)
+    tmp_path = save_upload(file, suffix)
     try:
-        exif_args = ["-overwrite_original"]
-
-        # ১. AI & C2PA Metadata Stripping
-        if strip_ai:
-            exif_args.extend([
+        args = ["-overwrite_original"]
+        if strip_all:
+            args.append("-all=")
+        elif strip_ai:
+            # Remove common AI/software markers without changing image pixels.
+            args.extend([
                 "-C2PA:all=",
                 "-XMP-c2pa:all=",
                 "-Software=",
                 "-XMP:Software=",
                 "-XMP:CreatorTool=",
-                "-XMP-iptcExt:DigitalSourceType="
+                "-XMP-iptcExt:DigitalSourceType=",
             ])
 
-        # ২. সম্পূর্ণ মেটাডাটা ক্লিন
-        if strip_all:
-            exif_args.append("-all=")
-
-        # ৩. কাস্টম ডেট অ্যান্ড টাইম
         if custom_date:
-            exif_args.append(f"-AllDates={custom_date}")
+            # ExifTool accepts YYYY:MM:DD HH:MM:SS for AllDates.
+            import re
+            if not re.fullmatch(r"\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}", custom_date.strip()):
+                raise HTTPException(status_code=422, detail="Invalid date format. Use YYYY:MM:DD HH:MM:SS.")
+            args.append(f"-AllDates={custom_date.strip()}")
 
-        # ৪. কাস্টম ক্যামেরা মডেল
-        if camera_model:
-            exif_args.append(f"-Model={camera_model}")
+        if camera_model and camera_model.strip():
+            if len(camera_model.strip()) > 120:
+                raise HTTPException(status_code=422, detail="Camera model must be 120 characters or fewer.")
+            args.append(f"-Model={camera_model.strip()}")
 
-        # কোনো অপশন সিলেক্ট করা থাকলে ExifTool রান করবে
-        if len(exif_args) > 1:
-            exif_args.append(tmp_path)
-            run_exiftool(exif_args)
+        # Run only if at least one metadata operation was requested.
+        if len(args) > 1:
+            run_exiftool([*args, tmp_path])
 
-        # অরিজিনাল ফরম্যাটেই ফাইল রেসপন্স পাঠানো
+        original_name = Path(file.filename or f"image{suffix}").name
+        safe_stem = Path(original_name).stem[:100] or "image"
+        output_name = f"processed_{safe_stem}{suffix}"
         media_type = file.content_type or "application/octet-stream"
         return FileResponse(
             path=tmp_path,
-            filename=f"processed_{file.filename}",
+            filename=output_name,
             media_type=media_type,
-            background=None
+            background=BackgroundTask(os.remove, tmp_path),
         )
-    except Exception as e:
+    except Exception:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/")
-def home():
-    return {"status": "Metadata Masterclass Engine is Live!"}
+        raise
+    finally:
+        await file.close()
