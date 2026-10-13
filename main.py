@@ -13,14 +13,15 @@ from starlette.background import BackgroundTask
 
 app = FastAPI(title="Metadata Masterclass API", version="1.1.0")
 
-# Set FRONTEND_ORIGINS on the hosting service to comma-separated exact origins,
-# e.g. https://your-frontend.vercel.app,https://your-domain.com
-_raw_origins = os.getenv("FRONTEND_ORIGINS", "*")
-_allowed_origins = [origin.strip() for origin in _raw_origins.split(",") if origin.strip()]
-# Wildcard origins must not be combined with credentialed browser requests.
+# Frontend origin is configured directly in code, so no Render environment
+# variable is required for CORS. Keep origins exact (scheme + hostname only).
+ALLOWED_ORIGINS = [
+    "https://img-frontend-tau.vercel.app",
+    "http://localhost:3000",  # local development only
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_allowed_origins or ["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
